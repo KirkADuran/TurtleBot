@@ -1,0 +1,387 @@
+#!/usr/bin/env python
+import numpy as np
+import rospy, tf
+import cv2, sys
+import math
+from copy import deepcopy
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from std_msgs.msg import Float32
+from std_msgs.msg import Bool,String
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker
+
+OBSTACLE_THRESHOLD=1.0
+MAX_LIN_VEL = .7
+MAX_ROT_VEL = 3.14
+BASE_DIAMETER = .23
+WHEEL_RADIUS = .035
+WHEEL_WIDTH = .021 
+LINEAR_THRESHOLD = .05 
+ROTATIONAL_THRESHOLD = 7.5 
+MATRIX_SIMILARITY_THRESHOLD = .01 
+
+
+class ObstacleAvoidingRobot():
+
+    # ------------- Callback Functions --------------
+
+    def odomCallback(self, odom_msg):
+        """Callback for Odometry Messages"""
+        self.odom = odom_msg
+
+    def laserscanCallback(self, laserscan_msg):
+        self.laserscan = laserscan_msg 
+        self.center_b = self.isWall(self.laserscan.ranges[288:431])
+        if not self.wall_following:
+            self.checkWall()
+            self.wall_pub.publish(Bool(self.wall_following))
+
+    def amclposeCallback(self, amclpose_msg):
+        self.amclpose = amclpose_msg
+
+    def calculateMLine(self,goal):
+        self.Mline_points = []
+        xg = goal[0]
+        yg = goal[1]
+        x = self.acmlpose.pose.pose.position.x
+        y = self.acmlpose.pose.pose.position.y
+        dx = round((xg-x)/1000,2)
+        dy = round((yg-y)/1000,2)
+        for i in range(1001):
+            self.Mline_points.append((x+i*dx,y+i*dy))
+
+    def checkMline(self):
+        x = self.acmlpose.pose.pose.position.x
+        y = self.acmlpose.pose.pose.position.y
+        pos = (x,y)
+        if pos in self.Mline_points:
+            self.Mline = True
+        
+    def getTangentLine(self,scans, mint):
+        angle_inc = self.laserscan.angle_increment
+        angle_min = mint * angle_inc
+        distances = scans
+        x = []
+        y = []
+        for i, dist in enumerate(distances): 
+            if not math.isnan(dist) and dist < 10000:
+                cur_angle = angle_min + i*angle_inc
+                x.append((dist  * math.cos(cur_angle)) +  + self.odom.pose.pose.position.x)
+                y.append((dist * math.sin(cur_angle))  + self.odom.pose.pose.position.y)
+        if (len(x) == 0 or len(y) == 0):
+            self.theta = 45
+            self.tan.publish(Float32(self.theta))
+            return self.theta
+        self.theta = 90 - np.abs(math.degrees(math.atan(np.polyfit(np.array(x),np.array(y),1)[0])))
+        if self.theta < 45:
+            self.theta = 45
+            self.corner = True
+        self.tan.publish(Float32(self.theta))
+        return self.theta
+
+    def checkWall(self):
+        if (self.center_b  <= 1):
+            self.wall_following = True
+
+    def getAngle(self,goal):
+        xg = goal[0]
+        yg = goal[1]
+        x = self.amclpose.pose.pose.position.x
+        y = self.amclpose.pose.pose.position.y
+        #m = (xg-x)/(yg-y)
+        goal_angle = math.degrees(abs(math.atan2(yg,xg)))
+        robot_angle = self.getAngularZFromAMCL()
+        return goal_angle - robot_angle
+
+
+    def driveStraightAMCL(self,speed):
+        rospy.logwarn("Driving straight for {0} m at {1} m/s using AMCL".format(speed))
+        twist_msg = Twist()
+        twist_msg.linear.x = speed
+        twist_msg.angular.z = 0.0
+        start_position = self.amclpose.pose.pose.position
+        start = (round(start_position.x,2),round(start_position.y,2))
+
+        def finish_condition():
+            #YOUR IMPLEMENTATION HERE
+            rospy.logwarn("Checking driveStraightAMCL finish_condition")
+            current_position = self.amclpose.pose.pose.position
+            current = (round(current_position.x,2),round(current_position.y,2))
+            at_goal = (self.goal[0] == current)
+            if at_goal:
+                self.goals.pop(0)
+            p_terms = [0, 0]
+            return at_goal, p_terms
+        return twist_msg, finish_condition
+
+    def goToGoal(self):
+        if len(self.goals) == 0:
+            print("Goals Done")
+        else:
+            goal = self.goals[0]
+            #self.publishRViZMarker()
+            self.calculateMLine(goal)
+            theta = self.getAngle(goal)
+            self.commands.append([self.rotate, theta])
+            self.commands.append([self.driveStraightAMCL, .1])
+
+
+    def isWall(self,ranges):
+        return min(ranges)
+
+    def wallFollowProtocol(self):
+        self.wall_pub.publish(Bool(self.wall_following))
+        rospy.logerr("WALL FOLLOWING PROTOCOL: ENGAGED!")
+        """Once wall_follow TRUE, rotate on tanget, step, return to object. If object lost trigger corner, move 45"""
+        
+        if self.Mline:
+            self.wall_following = False
+            self.goToGoal()
+        else:
+            if self.turn == 1:
+                if self.center_b > 3:
+                    self.corner = True
+                else:
+                    self.corner = False
+                self.turn = 2
+                self.commands.append([self.rotate, self.getTangentLine(self.laserscan.ranges[288:431], 288)])
+            elif self.turn ==2:
+                self.turn = 3
+                self.checkMline()
+                if not self.corner:
+                    self.commands.append([self.driveStraightOdometry, .5, 0.5])
+                else:
+                    self.commands.append([self.driveStraightOdometry, .5, 0.5])
+            elif self.turn == 3:
+                self.turn = 1
+                if self.corner:
+                    self.commands.append([self.rotate, -abs(3*self.theta)])
+                else:
+                    self.commands.append([self.rotate, -abs(self.theta)])
+        
+        
+    def driveStraightOdometry(self, speed, distance):
+        """Drives the Turtlebot forward for the given distance at the given 
+        speed. The finish condition relies on odometry information."""
+        rospy.logwarn("Driving straight for {0} m at {1} m/s using odometry".format(distance, speed))
+        twist_msg = Twist()
+        twist_msg.linear.x = speed
+        twist_msg.angular.z = 0.0
+        while(True):
+            start_position = self.odom.pose.pose.position
+            start = np.array([start_position.x,start_position.y,start_position.z])
+            if start.sum() != 0.0:
+                break
+
+        def finish_condition():
+            #YOUR IMPLEMENTATION HERE
+            #rospy.logwarn("Checking driveStraightOdometry finish_condition")
+            current_position = self.odom.pose.pose.position
+            current = np.array([current_position.x,current_position.y,current_position.z])
+            at_goal = (abs(np.linalg.norm(current - start)) - distance) >= 0
+            error = (abs(np.linalg.norm(current - start))/distance)
+            if (error < 0.5):
+                p_term = 0.5 + error
+            else:
+                p_term = 1 - (error)*0.95
+            p_term = p_term*speed
+            p_terms = [p_term, 0]
+            return at_goal, p_terms
+        return twist_msg, finish_condition
+
+    def getAngularZFromAMCL(self):
+        ori = self.amclpose.pose.pose.orientation
+        (x, y, z) = tf.transformations.euler_from_quaternion([ori.x,ori.y,ori.z,ori.w]) 
+        return math.degrees(z)
+        #-------------------------
+
+    def rotate(self, angle):
+        angle = self.normalizeAngle(angle)
+        rospy.logwarn("Rotating {0} degrees".format(angle))
+        def getAngularZFromOdom(odom):
+            ori = odom.pose.pose.orientation
+            (x, y, z) = tf.transformations.euler_from_quaternion([ori.x,ori.y,ori.z,ori.w]) 
+            return math.degrees(z)
+        twist_msg = Twist()
+        while(True):
+            starting_angle = getAngularZFromOdom(self.odom)
+            if starting_angle != 0.0:
+                break
+        
+        twist_msg.angular.z = ((angle)/abs(angle))*ROTATIONAL_THRESHOLD*0.025
+
+        def finish_condition():
+            current_angle = getAngularZFromOdom(self.odom)
+            diff = self.angularDistance(starting_angle, current_angle)
+            at_goal = False
+            if diff >= abs(angle):
+                at_goal = True
+            error = (self.angularDistance(starting_angle, current_angle)/angle)
+            if (error < 0.5):
+                p_term = 0.5 + error
+            else:
+                p_term = 1 - (error)*0.95
+            p_term = p_term*((angle)/abs(angle))*ROTATIONAL_THRESHOLD*0.05
+            p_terms = [0, p_term]
+            return at_goal, p_terms 
+
+        return twist_msg, finish_condition
+    
+    def default_finish_condition(self):
+        return True, [0,0]
+
+    def applyPConstraint(self, twist_msg, p_terms):
+            #twist_msg.linear.x = p_terms[0]
+            #twist_msg.angular.z = p_terms[1]
+            return twist_msg
+
+    def limitTwistMsg(self, twist_msg):
+        # Limit Turtlebot linear and angular velocities to reasonable values
+        twist_msg.linear.x = min(twist_msg.linear.x, MAX_LIN_VEL)
+        twist_msg.angular.z = min(twist_msg.angular.z, MAX_ROT_VEL)
+        return twist_msg
+        
+    def copyOdom(self, message=-1):
+        """perform a deep copy of the provided odometry message"""
+        if message == -1:
+            message = self.odom
+        return deepcopy(message)
+
+    def angularDistance(self, angle1, angle2):
+        phi = abs(angle2 - angle1) % 360
+        return 360 - phi if phi > 180 else phi
+    
+    def normalizeAngle(self, angle):
+        """wrap the given angle so that if it goes below -180 it returns to +180
+        and vice versa."""
+        if (angle > 0):
+            angle %= 360
+            if(angle > 180):
+                angle -= 360
+        elif(angle < 0):
+            angle %= -360
+            if(angle < -180):
+                angle += 360
+        return angle
+
+    def generateGoals(self):
+        x = self.amclpose.pose.pose.position.x
+        y = self.amclpose.pose.pose.position.y
+        goals = [(x-2.0,y),(x-2.0,y+1.0),(x,y+1.0),(x,y)]
+        print("Goals:", goals)
+        return [(x-2.0,y),(x-2.0,y+1.0),(x,y+1.0),(x,y)]
+
+    def publishRViZMarker(self):
+        start_pos = Point()
+        goal_pos = Point()
+        start_pos.x , start_pos.y = (self.amclpose.pose.pose.position.x, self.amclpose.pose.pose.position.y)	
+        goal_pos.x , goal_pos.y = (self.goal[0][0], self.goal[0][1])
+        mkr = Marker()
+        mkr.header.frame_id = "map"
+        mkr.action = mkr.ADD
+        mkr.type = mkr.LINE_LIST
+        mkr.scale.x = 0.1
+        mkr.points.append(Point(start_pos.x, start_pos.y, 0.0))
+        mkr.points.append(Point(goal_pos.x, goal_pos.y, 0.0))
+        mkr.color.a = 1.0
+        mkr.color.r = 1.0
+        mkr.color.g = 0.0
+        mkr.color.b = 1.0
+        self.mkr_pub.publish(mkr)
+
+    def executeTrajectory(self):
+        self.commands.append([self.driveStraightOdometry, .3, 1.5])
+
+    def shutdown(self):
+        """ Stop the Turtlebot"""
+        rospy.loginfo("Stopping Turtlebot")
+        rospy.sleep(1)
+    # ------------- Constructor --------------
+    def __init__(self):
+        rospy.init_node('obstacle_avoider')
+        self.laserscan=LaserScan()
+        self.left = None
+        self.odom = Odometry()
+        self.odom_listener = tf.TransformListener()
+        self.corner = False
+        self.center_left = None
+        self.center = None
+        self.center_right = None
+        self.right = None
+        self.left_b = False
+        self.center_left_b = False
+        self.center_b = False
+        self.center_right_b = False
+        self.right_b = False
+        self.commands = []
+        self.theta = 0
+        self.amclpose = PoseWithCovarianceStamped()
+        self.wall_action = False
+        self.wall_following = False
+        self.turn = 1
+        self.Mline = False
+        self.Mline_points = []
+        self.goals = self.generateGoals()
+        self.amclpose_sub=rospy.Subscriber('/amcl_pose',PoseWithCovarianceStamped,self.amclposeCallback,queue_size=10)
+        self.tan = rospy.Publisher('/tangent_angle', Float32, queue_size=1)
+        self.wall_pub = rospy.Publisher('/wall_follow', Bool, queue_size=1)
+        self.cmd_vel = rospy.Publisher('cmd_vel_mux/input/navi', Twist, queue_size=10)
+        self.laserscan_sub=rospy.Subscriber('/scan',LaserScan, self.laserscanCallback, queue_size=10)
+        self.odom_sub = self.odom_sub = rospy.Subscriber('odom', Odometry, self.odomCallback,queue_size=60)
+        self.mkr_pub = rospy.Publisher('/rviz_markers', Marker, queue_size = 10)
+
+
+        rospy.on_shutdown(self.shutdown)
+
+        #############
+        # MAIN LOOP #
+        #############
+
+
+        r = rospy.Rate(50)
+        r.sleep()   
+        #self.executeTrajectory() # comment out if not using simulator
+        self.goToGoal()
+        original_twist_msg, finish_condition = Twist(), self.default_finish_condition
+       
+        while not rospy.is_shutdown():
+            action_finished, p_terms = finish_condition()
+
+            if(self.wall_following and not self.wall_action):
+                self.commands = []
+                original_twist_msg = Twist()
+                self.wallFollowProtocol()
+                action_finished = True
+                self.wall_action = True
+
+
+            if(action_finished and len(self.commands) != 0):
+                f = self.commands.pop(0)
+                original_twist_msg, finish_condition = f[0](*f[1:])
+
+
+            # else stop the robot
+            elif(action_finished):
+                #rospy.logwarn("There are no more actions to perform")
+                original_twist_msg, finish_condition = Twist(), self.default_finish_condition
+                self.wall_action = False
+
+            # apply any modifications to the twist_msg
+            twist_msg = deepcopy(original_twist_msg)
+            twist_msg = self.applyPConstraint(twist_msg, p_terms)
+            twist_msg = self.limitTwistMsg(twist_msg)
+
+            # publish Twist messages and wait a little bit
+            self.cmd_vel.publish(twist_msg)
+            r.sleep()
+
+
+
+if __name__ == '__main__':
+    try:
+        ObstacleAvoidingRobot()
+    except rospy.ROSInterruptException:
+        pass
